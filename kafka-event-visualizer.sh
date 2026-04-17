@@ -101,16 +101,65 @@ if ! command -v python3 &>/dev/null; then
     exit 1
 fi
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="${SCRIPT_DIR}/.venv"
+PYTHON_BIN="python3"
+PYTHON_VERSION="$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+
+ensure_venv() {
+    if [ -x "${VENV_DIR}/bin/python" ]; then
+        return 0
+    fi
+
+    echo "Creating local virtual environment at ${VENV_DIR}..."
+    if python3 -m venv "${VENV_DIR}" &>/dev/null; then
+        return 0
+    fi
+
+    echo "ERROR: failed to create a Python virtual environment at ${VENV_DIR}."
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        if [ "${ID:-}" = "ubuntu" ] || [ "${ID_LIKE:-}" = "debian" ] || [[ "${ID_LIKE:-}" == *debian* ]]; then
+            echo "On ${PRETTY_NAME:-this system}, install venv support with:"
+            echo "  sudo apt update"
+            echo "  sudo apt install python${PYTHON_VERSION}-venv"
+            exit 1
+        fi
+    fi
+
+    echo "Install the Python 3 venv support package for your distro and re-run this script."
+    exit 1
+}
+
+ensure_pip() {
+    if "${PYTHON_BIN}" -m pip --version &>/dev/null; then
+        return 0
+    fi
+
+    echo "pip is missing in the selected Python environment; attempting to bootstrap it..."
+    if "${PYTHON_BIN}" -m ensurepip --upgrade &>/dev/null; then
+        return 0
+    fi
+
+    echo "ERROR: pip could not be initialized for ${PYTHON_BIN}."
+    exit 1
+}
+
+ensure_venv
+PYTHON_BIN="${VENV_DIR}/bin/python"
+
 MISSING=()
-python3 -c "import rich" 2>/dev/null || MISSING+=("rich")
-python3 -c "import kafka" 2>/dev/null || MISSING+=("kafka-python")
+"${PYTHON_BIN}" -c "import rich" 2>/dev/null || MISSING+=("rich")
+"${PYTHON_BIN}" -c "import kafka" 2>/dev/null || MISSING+=("kafka-python")
 
 if [ ${#MISSING[@]} -gt 0 ]; then
+    ensure_pip
     echo "Installing missing Python packages: ${MISSING[*]}"
-    pip3 install --user "${MISSING[@]}"
+    "${PYTHON_BIN}" -m pip install "${MISSING[@]}"
 fi
 
-exec python3 - "$@" << 'PYTHON_EOF'
+exec "${PYTHON_BIN}" - "$@" << 'PYTHON_EOF'
 import argparse
 import json
 import os
@@ -1737,7 +1786,7 @@ def main():
                         help="Kafka topic. Omit this to open a topic picker.")
     parser.add_argument("--demo", action="store_true", help="Run in demo mode (no Kafka needed)")
     parser.add_argument("--demo-rate", type=float, default=3.0,
-                        help="Average demo events per second when running with --demo")
+                        help="Average demo events per second; implies --demo when explicitly set")
     parser.add_argument("--window-size", type=int, default=2000,
                         help="Maximum number of loaded history events to keep in memory")
     parser.add_argument("--history-batch-size", type=int, default=200,
@@ -1753,6 +1802,10 @@ def main():
     parser.add_argument("--time-field",
                         help="JSON field to use as the event timestamp; overrides auto-detection")
     args = parser.parse_args()
+    demo_requested = args.demo or any(
+        arg == "--demo-rate" or arg.startswith("--demo-rate=")
+        for arg in sys.argv[1:]
+    )
 
     if args.since and args.since_minutes is not None:
         parser.error("--since and --since-minutes cannot be used together")
@@ -1764,11 +1817,11 @@ def main():
         since_time = datetime.now().astimezone() - timedelta(minutes=args.since_minutes)
 
     topic = args.topic
-    if not topic and not args.demo:
+    if not topic and not demo_requested:
         topic = pick_topic(args.bootstrap)
         if not topic:
             return
-    if not args.demo and since_time is None:
+    if not demo_requested and since_time is None:
         since_time, canceled = pick_start_time()
         if canceled:
             return
@@ -1778,7 +1831,7 @@ def main():
     viz = EventBusVisualizer(
         bootstrap_servers=args.bootstrap,
         topic=topic,
-        demo=args.demo,
+        demo=demo_requested,
         dynamic=True,
         show_ephemeral_groups=args.show_ephemeral_groups,
         since_time=since_time,

@@ -21,7 +21,8 @@ The entrypoint is [`kafka-event-visualizer.sh`](./kafka-event-visualizer.sh).
 
 The shell wrapper:
 - checks for `python3`
-- installs `rich` and `kafka-python` if missing
+- creates a local `.venv` if needed
+- installs `rich` and `kafka-python` there if missing
 - runs the embedded Python application via heredoc
 
 The UI is built with `rich`, and Kafka access uses `kafka-python`.
@@ -32,9 +33,28 @@ The UI is built with `rich`, and Kafka access uses `kafka-python`.
 - Access to a Kafka broker
 - A terminal with enough width/height to comfortably render the TUI
 
-The script will auto-install these Python packages if needed:
+The script will auto-install these Python packages into a local `.venv` if needed:
 - `rich`
 - `kafka-python`
+
+### WSL Requirements
+
+If you run this from WSL, Python virtualenv support must be installed for the system Python. On Ubuntu/Debian-based WSL distros, install the matching `venv` package first:
+
+```bash
+sudo apt update
+sudo apt install python3.12-venv
+```
+
+If your WSL image has a different Python minor version, replace `3.12` with the version reported by `python3 --version`.
+
+The script creates and reuses a project-local `.venv`, so it does not need to install packages into the system Python.
+
+If Kafka is running outside WSL, make sure the broker is reachable from the WSL environment and pass an explicit bootstrap address when needed:
+
+```bash
+./kafka-event-visualizer.sh --bootstrap <host>:9092
+```
 
 ## Usage
 
@@ -66,7 +86,7 @@ Run demo mode:
 
 ```bash
 ./kafka-event-visualizer.sh --demo
-./kafka-event-visualizer.sh --demo --demo-rate 25
+./kafka-event-visualizer.sh --demo-rate 25
 ```
 
 Tune the loaded history window:
@@ -108,7 +128,7 @@ Older-history fetches use a separate temporary consumer so the live tail consume
 - `--demo`
   Run without Kafka and generate fake traffic.
 - `--demo-rate N`
-  Average number of demo events per second.
+  Average number of demo events per second. Explicitly setting this also enables demo mode.
 - `--since ISO_TIMESTAMP`
   Replay from a specific point in time.
 - `--since-minutes N`
