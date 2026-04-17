@@ -1,6 +1,6 @@
 # Kafka Event Visualizer
 
-A self-contained terminal UI for exploring Kafka traffic in real time.
+A self-contained terminal UI for exploring Kafka traffic in near real time.
 
 The project is intentionally lightweight: one shell script, an embedded Python app, and no packaging ceremony. It is meant for local debugging, topic exploration, and quick history browsing while developing against Kafka.
 
