@@ -31,15 +31,13 @@
 #
 # Controls
 # --------
-# Event pane and lag pane share the same navigation model. Use `Tab` to switch
-# focus between them.
-#
-# - `j` / `k` or Up / Down: move selection
+# - `j` / `k` or Up / Down: move within pane
 # - `PgUp` / `PgDn`: page up / down
 # - `g` / `G`: jump to top / bottom
-# - `Tab`: switch focus between Events and Consumer Group Lag
+# - `Tab` / `Shift+Tab`: switch pane (forward/backward)
 # - `f`: return to FOLLOW mode / resume tailing newest events
 # - `b`: load an older history slice while browsing the event pane
+# - `:`: filter by event type pattern (case-insensitive, supports wildcards)
 # - `q` or `Ctrl+C`: exit
 #
 # History Browser Model
@@ -88,6 +86,9 @@
 #   Number of older events to fetch each time `b` is pressed.
 # - `--show-ephemeral-groups`
 #   Include UUID-like consumer groups in the lag pane.
+# - `--filter PATTERN`
+#   Filter events by type pattern. Supports wildcards (e.g., order_* matches order_created, order_shipped, etc.).
+#   Can be toggled interactively with `:` key.
 #
 # Notes
 # -----
@@ -1780,7 +1781,49 @@ class EventBusVisualizer:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Kafka Event Visualizer")
+    parser = argparse.ArgumentParser(
+        description="Kafka Event Visualizer - Terminal UI for exploring Kafka events in real-time",
+        epilog="""
+QUICK START:
+  ./kafka-event-visualizer.sh              # Topic picker + recent 200 + tail
+  ./kafka-event-visualizer.sh --demo       # Demo mode (no Kafka needed)
+  ./kafka-event-visualizer.sh --filter order  # Filter events by type (case-insensitive, wildcard)
+
+PANES:
+  Events (left)      - Event log with type, key, timestamp
+  Payload (middle)   - JSON payload of selected event
+  Lag (right)        - Consumer group lag per topic
+
+KEYBOARD CONTROLS:
+  Navigation:
+    j/k, ↑/↓         - Move within pane
+    PgUp/PgDn        - Page up/down
+    g/G              - Jump to top/bottom
+    Tab / Shift+Tab  - Switch pane (forward/backward)
+
+  Event Control:
+    f                - Follow mode (tail newest)
+    b                - Load older history batch
+    :                - Filter by event type pattern
+
+  Other:
+    q, Ctrl+C        - Exit
+
+EXAMPLES:
+  Replay from 1 hour ago:
+    ./kafka-event-visualizer.sh --topic orders --since-minutes 60
+
+  Filter for order events:
+    ./kafka-event-visualizer.sh --topic events --filter order
+
+  Custom broker:
+    ./kafka-event-visualizer.sh --bootstrap kafka.prod:9092 --topic events
+
+  Load 5000 events into memory:
+    ./kafka-event-visualizer.sh --window-size 5000
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--bootstrap", default="localhost:9092", help="Kafka bootstrap servers")
     parser.add_argument("--topic",
                         help="Kafka topic. Omit this to open a topic picker.")
@@ -1801,6 +1844,8 @@ def main():
                         help="JSON field to use as the event type; overrides auto-detection")
     parser.add_argument("--time-field",
                         help="JSON field to use as the event timestamp; overrides auto-detection")
+    parser.add_argument("--filter",
+                        help="Filter events by type pattern. Supports wildcards (e.g., order_* matches order_created, order_shipped, etc.)")
     args = parser.parse_args()
     demo_requested = args.demo or any(
         arg == "--demo-rate" or arg.startswith("--demo-rate=")
