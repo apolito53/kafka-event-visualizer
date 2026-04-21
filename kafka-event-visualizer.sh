@@ -38,6 +38,7 @@
 # - `PgUp` / `PgDn`: page up / down
 # - `g` / `G`: jump to top / bottom
 # - `Tab` / `Shift+Tab`: switch focus between panes
+# - Left / Right: change time window in Distribution and Lag panes
 # - `f`: return to FOLLOW mode / resume tailing newest events
 # - `b`: load an older history slice while browsing the event pane
 # - `:`: toggle filter prompt (enter event type pattern or leave blank to clear)
@@ -636,6 +637,8 @@ class EventBusVisualizer:
         self.unmapped_count = 0
         self.consumer_lag = None
         self.group_lags = {}
+        self.lag_history = deque(maxlen=10000)
+        self.lag_window_index = 0
         self.status_message = None
         self.status_level = "dim"
         self._own_group_id = f"kafka-event-visualizer-{int(time.time())}"
@@ -658,6 +661,19 @@ class EventBusVisualizer:
         self._tty = None
         self.filter_pattern = filter_pattern
         self.event_type_counts = {}
+        self.stats_time_windows = [
+            ("All", None),
+            ("5m", 5 * 60),
+            ("30m", 30 * 60),
+            ("1h", 60 * 60),
+            ("1d", 86400),
+            ("7d", 7 * 86400),
+            ("30d", 30 * 86400),
+            ("90d", 90 * 86400),
+            ("180d", 180 * 86400),
+            ("1y", 365 * 86400),
+        ]
+        self.stats_window_index = 0
         self.filter_interactive_mode = False
         self.filter_input = ""
         self.muted_types = set()
@@ -771,6 +787,8 @@ class EventBusVisualizer:
 
                 with self.lock:
                     self.group_lags = lags
+                    if lags:
+                        self.lag_history.append((time.time(), dict(lags)))
                     self._mark_dirty()
             except Exception:
                 pass
@@ -1143,6 +1161,8 @@ class EventBusVisualizer:
                 lag_data = msg["__lag_data"]
                 with self.lock:
                     self.group_lags = lag_data
+                    if lag_data:
+                        self.lag_history.append((time.time(), dict(lag_data)))
                     self._mark_dirty()
                 continue
 
@@ -1494,7 +1514,7 @@ class EventBusVisualizer:
 
     def _toggle_focus(self, backwards=False):
         with self.lock:
-            panes = ["history", "payload", "queue", "muted"]
+            panes = ["history", "payload", "stats", "queue", "muted"]
             current_idx = panes.index(self.focus_pane) if self.focus_pane in panes else 0
             if backwards:
                 self.focus_pane = panes[(current_idx - 1) % len(panes)]
@@ -1770,6 +1790,24 @@ class EventBusVisualizer:
                             self._request_older_history()
                         else:
                             self._move_selection(self._page_size())
+                elif chars == b"\x1b[C":
+                    if focus_pane == "stats":
+                        with self.lock:
+                            self.stats_window_index = min(self.stats_window_index + 1, len(self.stats_time_windows) - 1)
+                            self._mark_dirty()
+                    elif focus_pane == "queue":
+                        with self.lock:
+                            self.lag_window_index = min(self.lag_window_index + 1, len(self.stats_time_windows) - 1)
+                            self._mark_dirty()
+                elif chars == b"\x1b[D":
+                    if focus_pane == "stats":
+                        with self.lock:
+                            self.stats_window_index = max(self.stats_window_index - 1, 0)
+                            self._mark_dirty()
+                    elif focus_pane == "queue":
+                        with self.lock:
+                            self.lag_window_index = max(self.lag_window_index - 1, 0)
+                            self._mark_dirty()
                 elif chars in (b"g",):
                     if focus_pane == "queue":
                         self._set_queue_selection(0)
@@ -1918,13 +1956,29 @@ class EventBusVisualizer:
 
         return table
 
+    def _compute_lag_for_window(self):
+        _, window_secs = self.stats_time_windows[self.lag_window_index]
+        if not window_secs:
+            return dict(self.group_lags)
+        cutoff = time.time() - window_secs
+        max_lags = {}
+        for ts, snapshot in self.lag_history:
+            if ts >= cutoff:
+                for gid, lag in snapshot.items():
+                    if gid not in max_lags or lag > max_lags[gid]:
+                        max_lags[gid] = lag
+        return max_lags
+
     def _render_queue_panel(self, focused=False):
         table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1), expand=True)
+        is_windowed = self.lag_window_index > 0
+        lag_label = "Peak" if is_windowed else "Lag"
         table.add_column("Consumer Group", no_wrap=False, ratio=3)
-        table.add_column("Lag", justify="right", no_wrap=True, ratio=1)
+        table.add_column(lag_label, justify="right", no_wrap=True, ratio=1)
 
         with self.lock:
-            lag_items = sorted(self.group_lags.items(), key=lambda x: -x[1])
+            computed_lags = self._compute_lag_for_window()
+            lag_items = sorted(computed_lags.items(), key=lambda x: -x[1])
             max_rows = self._queue_page_size()
             self.queue_selected_index = max(0, min(self.queue_selected_index, max(len(lag_items) - 1, 0)))
             max_start = max(0, len(lag_items) - max_rows)
@@ -2002,14 +2056,39 @@ class EventBusVisualizer:
 
         return payload_text
 
-    def _render_stats_panel(self):
+    def _item_epoch(self, item):
+        bts = item.get("broker_timestamp_ms")
+        if isinstance(bts, (int, float)) and bts > 0:
+            return bts / 1000.0
+        d = item.get("date", "")
+        t = item.get("time", "")
+        if len(d) >= 10 and len(t) >= 8:
+            try:
+                return datetime.strptime(f"{d} {t}", "%Y-%m-%d %H:%M:%S").timestamp()
+            except ValueError:
+                pass
+        return None
+
+    def _render_stats_panel(self, focused=False):
         with self.lock:
-            type_counts = dict(self.event_type_counts)
+            window_label, window_secs = self.stats_time_windows[self.stats_window_index]
+            now_epoch = time.time()
+            cutoff = (now_epoch - window_secs) if window_secs else None
+            type_counts = {}
+            for item in self.event_history_all:
+                if cutoff:
+                    epoch = self._item_epoch(item)
+                    if epoch is not None and epoch < cutoff:
+                        continue
+                t = item.get("type")
+                if t:
+                    type_counts[t] = type_counts.get(t, 0) + 1
             filter_pattern = self.filter_pattern
-            total = self.total_count
 
         if not type_counts:
-            return Text("No events yet", style="dim")
+            return Text("No events in this window", style="dim")
+
+        total = sum(type_counts.values())
 
         sorted_types = sorted(type_counts.items(), key=lambda x: -x[1])[:12]
         stats_text = Text()
@@ -2095,7 +2174,7 @@ class EventBusVisualizer:
             status_text.append(f"  > {filter_input}_  ", style="bold cyan on black")
         if status_message:
             status_text.append(f"  {status_message}  ", style=status_level)
-        focus_labels = {"history": "Events", "payload": "Payload", "queue": "Lag", "muted": "Muted"}
+        focus_labels = {"history": "Events", "payload": "Payload", "stats": "Distribution", "queue": "Lag", "muted": "Muted"}
         focus_label = focus_labels.get(focus_pane, "Unknown")
         status_text.append(
             f"  Focus: {focus_label}  ",
@@ -2135,15 +2214,19 @@ class EventBusVisualizer:
             else:
                 controls_content.append("GUIDE\n", style="bold cyan")
                 controls_content.append("View events in left pane,\n", style="dim")
-                controls_content.append("payload in middle, lag on\n", style="dim")
-                controls_content.append("right. Use j/k to select\n", style="dim")
-                controls_content.append("events and Tab to switch\n", style="dim")
-                controls_content.append("between panes.\n", style="dim")
+                controls_content.append("payload/stats/lag on right.\n", style="dim")
+                controls_content.append("Use j/k to select events\n", style="dim")
+                controls_content.append("and Tab to switch panes.\n", style="dim")
+                controls_content.append("On Distribution or Lag\n", style="dim")
+                controls_content.append("pane, ←/→ changes time\n", style="dim")
+                controls_content.append("window.\n", style="dim")
                 controls_content.append("\nBROWSING\n", style="bold cyan")
                 controls_content.append("j/k/↑↓  Move/Scroll\n", style="dim")
                 controls_content.append("PgUp/PgDn  Page jump\n", style="dim")
                 controls_content.append("g/G  Top/Bottom\n", style="dim")
                 controls_content.append("Tab  Next pane\n", style="dim")
+                controls_content.append("←/→  Time window\n", style="dim")
+                controls_content.append("     (Distrib / Lag)\n", style="dim")
                 controls_content.append("\nEVENTS\n", style="bold cyan")
                 controls_content.append("f  Follow mode\n", style="dim")
                 controls_content.append("b  Load older\n", style="dim")
@@ -2233,7 +2316,7 @@ class EventBusVisualizer:
             log_title = "[bold black on bright_white] Event Log [/bold black on bright_white]" if focus_pane == "history" else "[bold]Event Log[/bold]"
             log_subtitle = "[dim]Event stream[/dim]"
             payload_title = "[bold black on bright_white] Latest Event Payload [/bold black on bright_white]" if focus_pane == "payload" else "[bold]Latest Event Payload[/bold]"
-            payload_subtitle = "[dim]Newest event JSON (scroll with j/k)[/dim]"
+            payload_subtitle = "[dim]Newest event JSON[/dim]"
 
         log_panel = Panel(
             self._render_history_panel(
@@ -2262,18 +2345,37 @@ class EventBusVisualizer:
             with self.lock:
                 self.queue_viewport_rows = max(estimated_queue_height - 4, 1)
 
+            stats_focused = focus_pane == "stats"
+            with self.lock:
+                window_label = self.stats_time_windows[self.stats_window_index][0]
+                window_idx = self.stats_window_index
+                window_count = len(self.stats_time_windows)
+            nav_left = "◀ " if window_idx > 0 else "  "
+            nav_right = " ▶" if window_idx < window_count - 1 else "  "
+            window_hint = f"{nav_left}[bold]{window_label}[/bold]{nav_right}"
+            stats_title = "[bold black on bright_white] Event Type Distribution [/bold black on bright_white]" if stats_focused else "[bold]Event Type Distribution[/bold]"
             stats_panel = Panel(
-                self._render_stats_panel(),
-                title="[bold]Event Type Distribution[/bold]",
-                subtitle="[dim]Top 12 by count[/dim]",
-                border_style="bright_yellow",
+                self._render_stats_panel(focused=stats_focused),
+                title=stats_title,
+                subtitle=f"[dim]{window_hint}[/dim]" if not stats_focused else window_hint,
+                border_style="bright_white" if stats_focused else "bright_yellow",
             )
             layout["stats"].update(stats_panel)
 
+            queue_focused = focus_pane == "queue"
+            with self.lock:
+                lag_window_label = self.stats_time_windows[self.lag_window_index][0]
+                lag_window_idx = self.lag_window_index
+            lag_nav_left = "◀ " if lag_window_idx > 0 else "  "
+            lag_nav_right = " ▶" if lag_window_idx < len(self.stats_time_windows) - 1 else "  "
+            lag_window_hint = f"{lag_nav_left}[bold]{lag_window_label}[/bold]{lag_nav_right}"
+            queue_title = "[bold black on bright_white] Consumer Group Lag [/bold black on bright_white]" if queue_focused else "[bold]Consumer Group Lag[/bold]"
+            queue_subtitle = lag_window_hint if queue_focused else f"[dim]{lag_window_hint}[/dim]"
             queue_panel = Panel(
-                self._render_queue_panel(focused=(focus_pane == "queue")),
-                title="[bold black on bright_white] Consumer Group Lag [/bold black on bright_white]" if focus_pane == "queue" else "[bold]Consumer Group Lag[/bold]",
-                border_style="bright_white" if focus_pane == "queue" else "yellow",
+                self._render_queue_panel(focused=queue_focused),
+                title=queue_title,
+                subtitle=queue_subtitle,
+                border_style="bright_white" if queue_focused else "yellow",
             )
             layout["queue"].update(queue_panel)
         else:
@@ -2353,7 +2455,8 @@ QUICK START:
 PANES:
   Events (left)      - Event log with type, key, timestamp
   Payload (middle)   - JSON payload of selected event
-  Lag (right)        - Consumer group lag per topic
+  Distribution       - Event type distribution by time window
+  Lag (right)        - Consumer group lag / peak lag by time window
 
 KEYBOARD CONTROLS:
   Navigation:
@@ -2361,6 +2464,7 @@ KEYBOARD CONTROLS:
     PgUp/PgDn        - Page up/down
     g/G              - Jump to top/bottom
     Tab / Shift+Tab  - Switch pane (forward/backward)
+    ←/→              - Change time window (Distribution / Lag pane)
 
   Event Control:
     f                - Follow mode (tail newest)

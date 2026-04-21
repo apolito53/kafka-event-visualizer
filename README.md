@@ -8,8 +8,8 @@ The project is intentionally lightweight: one shell script, an embedded Python a
 
 - Scrollable event list with key, date, time, and event type
 - Payload inspector for the selected event (scrollable)
-- Consumer group lag pane with severity coloring
-- Event type distribution panel with bar charts
+- Consumer group lag pane with live and time-windowed peak lag views
+- Event type distribution panel with selectable time windows and bar charts
 - Event filtering by type pattern (case-insensitive, wildcards)
 - Event muting — hide noisy event types, toggle via interactive UI
 - Topic picker when no topic is provided
@@ -102,7 +102,7 @@ If Kafka is running outside WSL, make sure the broker is reachable from the WSL 
 ./run_local.sh --filter ORDER
 
 # Wildcard pattern
-./run_local.sh --filter "INVOICE_*"
+./run_local.sh --filter "ORDER_*"
 
 # Interactive filter: press `:` in the UI
 ```
@@ -162,6 +162,7 @@ Test the UI without Kafka:
 | `PgUp` / `PgDn` | Page up / down |
 | `g` / `G` | Jump to top / bottom |
 | `Tab` / `Shift+Tab` | Cycle focus forward / backward |
+| `←` / `→` | Change time window (Distribution / Lag pane) |
 
 ### Event Control
 
@@ -176,12 +177,12 @@ Test the UI without Kafka:
 
 ### Panes
 
-Focus cycles through: **Events** → **Payload** → **Lag** → **Muted** → Events
+Focus cycles through: **Events** → **Payload** → **Distribution** → **Lag** → **Muted** → Events
 
 - **Events (left)**: Scrollable event log with type, key, timestamp
 - **Payload (middle top)**: JSON payload of selected event (scrollable)
-- **Stats (middle bottom)**: Event type distribution with bar chart
-- **Lag (right)**: Consumer group lag per topic
+- **Distribution (middle bottom)**: Event type distribution with bar chart and time window selector (`←`/`→`)
+- **Lag (right)**: Consumer group lag per topic, with peak lag over selected time windows
 - **Muted (sidebar)**: List of muted event types (navigate and unmute with `x`)
 
 ## Scripts
@@ -228,6 +229,14 @@ Runs a bridge in a temp pod, streams events to local visualizer via pipe:
 **Why a bridge pod?** Kafka advertised listeners inside k8s are often not reachable from your local machine. The bridge runs inside the cluster where it can access Kafka directly, and streams decoded JSON to the local visualizer over kubectl exec. Rich renders locally so the TUI stays responsive — no lag from rendering over a remote connection.
 
 The temporary pod is automatically cleaned up on exit.
+
+## Time Windows
+
+The Distribution and Lag panes support these windows: `All`, `5m`, `30m`, `1h`, `1d`, `7d`, `30d`, `90d`, `180d`, `1y`.
+
+Tab to the Distribution pane and use `←` / `→` to recalculate event type counts from all events currently loaded in memory, including historical events loaded on startup or through older-history browsing.
+
+Tab to the Lag pane and use `←` / `→` to switch from live lag to peak lag over the selected window. Lag snapshots are recorded about every 5 seconds while the visualizer is running, including lag data streamed through the Kubernetes bridge.
 
 ## Flags
 
