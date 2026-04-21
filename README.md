@@ -36,7 +36,7 @@ Run against local Kafka (default: `localhost:9092`):
 Run against Kafka in your k8s cluster:
 
 ```bash
-./run_on_k8s.sh --topic my-events --bootstrap kafka:9092
+./run_on_k8s.sh
 ```
 
 ## How It Works
@@ -134,13 +134,16 @@ If Kafka is running outside WSL, make sure the broker is reachable from the WSL 
 
 ```bash
 # Basic k8s usage
-./run_on_k8s.sh --topic my-events --bootstrap kafka:9092
+./run_on_k8s.sh
 
 # With filter
-./run_on_k8s.sh --topic my-events --bootstrap kafka:9092 --filter ORDER
+./run_on_k8s.sh --filter ORDER
 
 # Load 30 minutes of history
-./run_on_k8s.sh --topic my-events --bootstrap kafka:9092 --since-minutes 30
+./run_on_k8s.sh --since-minutes 30
+
+# Custom topic/bootstrap
+./run_on_k8s.sh --topic my-events --bootstrap kafka:9092
 ```
 
 ### Demo Mode
@@ -241,7 +244,7 @@ Tab to the Lag pane and use `←` / `→` to switch from live lag to peak lag ov
 ## Flags
 
 - `--bootstrap HOST:PORT`
-  Kafka bootstrap server list.
+  Kafka bootstrap server list. In k8s mode, defaults to `confluent-platform-cp-kafka:9092`.
 - `--topic TOPIC`
   Topic to inspect. If omitted, the script opens a topic picker.
 - `--demo`

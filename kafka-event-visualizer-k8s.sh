@@ -10,17 +10,19 @@
 #   ./kafka-event-visualizer-k8s.sh [options]
 #
 # Options:
-#   --topic TOPIC              Kafka topic (required)
+#   --topic TOPIC              Kafka topic. If omitted, choose from a topic picker.
 #   --bootstrap BOOTSTRAP      Kafka bootstrap servers inside the cluster
+#                               (default: confluent-platform-cp-kafka:9092)
 #   --since-minutes N          Load history from N minutes ago
 #   --history-count N          Number of recent events to preload (default: 200)
 #   --filter PATTERN           Filter events by type pattern
 #   --window-size N            Max events in memory (default: 2000)
 #
 # Examples:
+#   ./kafka-event-visualizer-k8s.sh
+#   ./kafka-event-visualizer-k8s.sh --filter ORDER
+#   ./kafka-event-visualizer-k8s.sh --since-minutes 30
 #   ./kafka-event-visualizer-k8s.sh --topic my-events --bootstrap kafka:9092
-#   ./kafka-event-visualizer-k8s.sh --topic my-events --bootstrap kafka:9092 --filter ORDER
-#   ./kafka-event-visualizer-k8s.sh --topic my-events --bootstrap kafka:9092 --since-minutes 30
 #
 # The temporary pod is automatically cleaned up on exit.
 set -euo pipefail
@@ -28,7 +30,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VISUALIZER_SCRIPT="$SCRIPT_DIR/kafka-event-visualizer.sh"
 POD_NAME="kafka-visualizer-$$"
-KAFKA_BOOTSTRAP=""
+KAFKA_BOOTSTRAP="confluent-platform-cp-kafka:9092"
 HTTP_PORT=18080
 
 # Defaults
@@ -51,22 +53,62 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ -z "$TOPIC" ]; then
-    echo "ERROR: --topic is required"
-    echo "Usage: $0 --topic TOPIC --bootstrap BOOTSTRAP_SERVERS [options]"
-    exit 1
-fi
-
-if [ -z "$KAFKA_BOOTSTRAP" ]; then
-    echo "ERROR: --bootstrap is required"
-    echo "Usage: $0 --topic TOPIC --bootstrap BOOTSTRAP_SERVERS [options]"
-    exit 1
-fi
-
 if [ ! -f "$VISUALIZER_SCRIPT" ]; then
     echo "ERROR: kafka-event-visualizer.sh not found at $VISUALIZER_SCRIPT"
     exit 1
 fi
+
+pick_topic() {
+    local topics=()
+    local selected=""
+
+    echo "Fetching topic metadata from $KAFKA_BOOTSTRAP..." >&2
+    if ! mapfile -t topics < <(
+        kubectl exec "$POD_NAME" -- python3 - "$KAFKA_BOOTSTRAP" <<'PY'
+import sys
+from kafka import KafkaConsumer
+
+bootstrap = sys.argv[1]
+consumer = KafkaConsumer(bootstrap_servers=bootstrap, consumer_timeout_ms=1000)
+try:
+    for topic in sorted(t for t in consumer.topics() if not t.startswith("__")):
+        print(topic)
+finally:
+    consumer.close()
+PY
+    ); then
+        echo "ERROR: failed to fetch Kafka topic metadata from $KAFKA_BOOTSTRAP" >&2
+        return 1
+    fi
+
+    if [ "${#topics[@]}" -eq 0 ]; then
+        echo "ERROR: no observable Kafka topics found from $KAFKA_BOOTSTRAP" >&2
+        return 1
+    fi
+
+    echo "" >&2
+    echo "Select a Kafka topic:" >&2
+    local i
+    for i in "${!topics[@]}"; do
+        printf '  %3d) %s\n' "$((i + 1))" "${topics[$i]}" >&2
+    done
+    echo "" >&2
+
+    while true; do
+        read -r -p "Topic number or exact topic name: " selected
+        if [[ "$selected" =~ ^[0-9]+$ ]] && [ "$selected" -ge 1 ] && [ "$selected" -le "${#topics[@]}" ]; then
+            TOPIC="${topics[$((selected - 1))]}"
+            return 0
+        fi
+        for i in "${!topics[@]}"; do
+            if [ "${topics[$i]}" = "$selected" ]; then
+                TOPIC="$selected"
+                return 0
+            fi
+        done
+        echo "Invalid selection. Enter a number from 1-${#topics[@]} or an exact topic name." >&2
+    done
+}
 
 cleanup() {
     if [ -n "${PF_PID:-}" ]; then
@@ -89,6 +131,10 @@ kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s >/dev/null
 
 echo "Installing kafka-python..." >&2
 kubectl exec "$POD_NAME" -- pip install --quiet kafka-python >/dev/null
+
+if [ -z "$TOPIC" ]; then
+    pick_topic
+fi
 
 # Build bridge args
 BRIDGE_ARGS="'$KAFKA_BOOTSTRAP', '$TOPIC', $HISTORY_COUNT"
