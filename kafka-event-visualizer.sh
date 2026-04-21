@@ -31,13 +31,18 @@
 #
 # Controls
 # --------
-# - `j` / `k` or Up / Down: move within pane
+# Event pane and lag pane share the same navigation model. Use `Tab` to switch
+# focus between them.
+#
+# - `j` / `k` or Up / Down: move selection
 # - `PgUp` / `PgDn`: page up / down
 # - `g` / `G`: jump to top / bottom
-# - `Tab` / `Shift+Tab`: switch pane (forward/backward)
+# - `Tab` / `Shift+Tab`: switch focus between panes
 # - `f`: return to FOLLOW mode / resume tailing newest events
 # - `b`: load an older history slice while browsing the event pane
-# - `:`: filter by event type pattern (case-insensitive, supports wildcards)
+# - `:`: toggle filter prompt (enter event type pattern or leave blank to clear)
+# - `x`: mute the selected event's type (hide all events of that type)
+# - `X`: clear all muted types
 # - `q` or `Ctrl+C`: exit
 #
 # History Browser Model
@@ -65,6 +70,10 @@
 #
 # 4. Custom broker/topic
 #    ./kafka-event-visualizer.sh --bootstrap localhost:9092 --topic orders
+#
+# 5. Filter by event type
+#    ./kafka-event-visualizer.sh --filter ORDER_CREATED
+#    ./kafka-event-visualizer.sh --filter "ORDER_*"
 #
 # Useful Flags
 # ------------
@@ -160,6 +169,7 @@ if [ ${#MISSING[@]} -gt 0 ]; then
     "${PYTHON_BIN}" -m pip install "${MISSING[@]}"
 fi
 
+exec 3<&0
 exec "${PYTHON_BIN}" - "$@" << 'PYTHON_EOF'
 import argparse
 import json
@@ -246,6 +256,18 @@ def classify_producer_dynamic(event_type, service_styles, producer_order,
 
 def get_consumers(event_type):
     return []
+
+
+def matches_filter(event_type, filter_pattern, muted_types=None):
+    if muted_types and event_type and event_type in muted_types:
+        return False
+    if not filter_pattern:
+        return True
+    import fnmatch
+    filter_pattern_lower = filter_pattern.lower()
+    if "*" not in filter_pattern_lower:
+        filter_pattern_lower = f"*{filter_pattern_lower}*"
+    return fnmatch.fnmatch(event_type.lower(), filter_pattern_lower)
 
 
 def svc_style(service):
@@ -586,9 +608,12 @@ class EventBusVisualizer:
     def __init__(self, bootstrap_servers="localhost:9092", topic=None,
                  demo=False, dynamic=True, show_ephemeral_groups=False, since_time=None,
                  type_field=None, time_field=None, demo_rate=3.0,
-                 history_window_size=2000, history_batch_size=200):
+                 history_window_size=2000, history_batch_size=200, filter_pattern=None,
+                 stdin_mode=False, http_bridge_url=None):
         self.bootstrap_servers = bootstrap_servers
         self.topic = topic
+        self.stdin_mode = stdin_mode
+        self.http_bridge_url = http_bridge_url
         self.demo = demo
         self.dynamic = dynamic
         self.show_ephemeral_groups = show_ephemeral_groups
@@ -603,6 +628,7 @@ class EventBusVisualizer:
         self.history_batch_size = max(int(history_batch_size), 50)
         self.running = True
 
+        self.event_history_all = deque()
         self.event_history = deque()
         self.pending_events = deque(maxlen=5000)
         self.loaded_event_ids = set()
@@ -613,19 +639,30 @@ class EventBusVisualizer:
         self.status_message = None
         self.status_level = "dim"
         self._own_group_id = f"kafka-event-visualizer-{int(time.time())}"
-        self._recent_timestamps = deque(maxlen=50)
+        self._recent_timestamps = deque()
         self.selected_index = 0
         self.viewport_start = 0
         self.viewport_rows = 10
         self.queue_selected_index = 0
         self.queue_viewport_start = 0
         self.queue_viewport_rows = 8
+        self.muted_selected_index = 0
+        self.muted_viewport_start = 0
+        self.muted_viewport_rows = 5
         self.follow_mode = True
         self.focus_pane = "history"
+        self.payload_scroll = 0
         self.history_loading = False
         self.history_exhausted = False
         self._demo_offset = 0
         self._tty = None
+        self.filter_pattern = filter_pattern
+        self.event_type_counts = {}
+        self.filter_interactive_mode = False
+        self.filter_input = ""
+        self.muted_types = set()
+        self._dirty = True
+        self._last_render_time = 0.0
 
         if dynamic:
             self.service_styles = dict(SERVICE_STYLES)
@@ -646,15 +683,20 @@ class EventBusVisualizer:
 
         self.lock = threading.Lock()
 
+    def _mark_dirty(self):
+        self._dirty = True
+
     def _set_status(self, message, level="dim"):
         with self.lock:
             self.status_message = message
             self.status_level = level
+            self._mark_dirty()
 
     def _clear_status(self):
         with self.lock:
             self.status_message = None
             self.status_level = "dim"
+            self._mark_dirty()
 
     def _update_lag(self, consumer):
         try:
@@ -669,6 +711,7 @@ class EventBusVisualizer:
                 total_lag += max(0, end - pos)
             with self.lock:
                 self.consumer_lag = total_lag
+                self._mark_dirty()
         except Exception:
             pass
 
@@ -698,7 +741,8 @@ class EventBusVisualizer:
                 lags = {}
                 for gid in group_ids:
                     if gid == self._own_group_id \
-                            or gid.startswith("kafka-event-visualizer-"):
+                            or "visualizer" in gid.lower() \
+                            or gid.startswith("console-consumer-"):
                         continue
                     if not self.show_ephemeral_groups and UUID_GROUP_RE.match(gid):
                         continue
@@ -727,6 +771,7 @@ class EventBusVisualizer:
 
                 with self.lock:
                     self.group_lags = lags
+                    self._mark_dirty()
             except Exception:
                 pass
             time.sleep(5)
@@ -836,7 +881,7 @@ class EventBusVisualizer:
 
     def _oldest_loaded_offsets_locked(self):
         offsets = {}
-        for item in self.event_history:
+        for item in self.event_history_all:
             topic = item.get("topic")
             partition = item.get("partition")
             offset = item.get("offset")
@@ -958,18 +1003,53 @@ class EventBusVisualizer:
                 history_consumer.close()
             with self.lock:
                 self.history_loading = False
+                self._mark_dirty()
+
+    def _load_http_history(self):
+        try:
+            import urllib.request
+            url = f"{self.http_bridge_url}/load-history?count={self.history_batch_size}"
+            response = urllib.request.urlopen(url, timeout=30)
+            result = json.loads(response.read().decode('utf-8'))
+            loaded = result.get('loaded', 0)
+            if loaded > 0:
+                self._set_status(f"Loaded {loaded} older events", level="bold cyan")
+            else:
+                self._set_status("No additional older events found", level="bold yellow")
+        except Exception as e:
+            self._set_status(f"HTTP history load error: {e}", level="bold red")
+        finally:
+            with self.lock:
+                self.history_loading = False
+                self._mark_dirty()
 
     def _request_older_history(self):
+        if self.stdin_mode and not self.http_bridge_url:
+            self._set_status("History loading unavailable in stdin mode", level="bold yellow")
+            return
+        if self.stdin_mode and self.http_bridge_url:
+            with self.lock:
+                if self.history_loading:
+                    return
+                if self.follow_mode:
+                    self.follow_mode = False
+                    self._flush_pending_events_locked()
+                self.history_loading = True
+                self.status_message = f"Loading older {self.history_batch_size} events..."
+                self.status_level = "bold cyan"
+                self._mark_dirty()
+            threading.Thread(target=self._load_http_history, daemon=True).start()
+            return
         with self.lock:
             if self.history_loading:
                 return
             if self.follow_mode:
-                self.status_message = "Pause browsing before loading older history"
-                self.status_level = "bold yellow"
-                return
+                self.follow_mode = False
+                self._flush_pending_events_locked()
             self.history_loading = True
             self.status_message = f"Loading older {self.history_batch_size} events..."
             self.status_level = "bold cyan"
+            self._mark_dirty()
         threading.Thread(target=self._load_older_history, daemon=True).start()
 
     def _consume_kafka(self):
@@ -1043,6 +1123,82 @@ class EventBusVisualizer:
 
         consumer.close()
 
+    def _consume_stdin(self):
+        self._set_status("Reading events from stdin...", level="bold cyan")
+        import io
+        pipe = io.open(3, "r", closefd=False)
+        history_phase = True
+        history_items = []
+        for raw_line in pipe:
+            if not self.running:
+                break
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if "__lag_data" in msg:
+                lag_data = msg["__lag_data"]
+                with self.lock:
+                    self.group_lags = lag_data
+                    self._mark_dirty()
+                continue
+
+            sentinel = msg.get("__sentinel")
+            if sentinel == "HISTORY_COMPLETE":
+                with self.lock:
+                    for item in history_items:
+                        self._append_oldest_event_locked(item)
+                    self._mark_dirty()
+                history_phase = False
+                self._set_status(f"Loaded {len(history_items)} historical events", level="bold cyan")
+                history_items = []
+                continue
+            if sentinel == "HISTORY_BATCH_COMPLETE":
+                count = msg.get("count", 0)
+                with self.lock:
+                    self.history_loading = False
+                    self._mark_dirty()
+                continue
+
+            event_type = msg.get("event_type", "UNKNOWN")
+            timestamp = msg.get("timestamp", datetime.now().isoformat())
+            key = msg.get("key")
+            payload = msg.get("payload")
+            topic = msg.get("topic")
+            partition = msg.get("partition")
+            offset = msg.get("offset")
+            broker_ts = msg.get("broker_timestamp_ms")
+            marker = msg.get("__marker")
+
+            if history_phase or marker == "history":
+                with self.lock:
+                    producer = self._classify_event_locked(event_type)
+                    item = self._build_event_item(
+                        event_type, timestamp, key, payload,
+                        producer=producer, topic=topic, partition=partition,
+                        offset=offset, broker_timestamp_ms=broker_ts,
+                    )
+                    if history_phase:
+                        history_items.append(item)
+                    else:
+                        self._append_oldest_event_locked(item)
+                        self._mark_dirty()
+            else:
+                self._ingest_event(
+                    event_type, timestamp, key, payload,
+                    topic=topic, partition=partition, offset=offset,
+                    broker_timestamp_ms=broker_ts,
+                )
+        if history_phase and history_items:
+            with self.lock:
+                for item in history_items:
+                    self._append_oldest_event_locked(item)
+                self._mark_dirty()
+            self._set_status(f"Loaded {len(history_items)} events (stream ended)", level="bold yellow")
+
     def _demo_producer(self):
         while self.running:
             delay = random.expovariate(self.demo_rate)
@@ -1088,13 +1244,19 @@ class EventBusVisualizer:
         )
 
     def _trim_history_locked(self, drop_from="oldest"):
-        while len(self.event_history) > self.history_window_size:
+        while len(self.event_history_all) > self.history_window_size:
             if drop_from == "newest":
-                removed = self.event_history.popleft()
+                removed = self.event_history_all.popleft()
+                if self.filter_pattern:
+                    if removed in self.event_history:
+                        self.event_history.remove(removed)
                 self.selected_index = max(0, self.selected_index - 1)
                 self.viewport_start = max(0, self.viewport_start - 1)
             else:
-                removed = self.event_history.pop()
+                removed = self.event_history_all.pop()
+                if self.filter_pattern:
+                    if removed in self.event_history:
+                        self.event_history.remove(removed)
             uid = self._event_uid(removed)
             if uid is not None:
                 self.loaded_event_ids.discard(uid)
@@ -1103,20 +1265,26 @@ class EventBusVisualizer:
         uid = self._event_uid(item)
         if uid is not None and uid in self.loaded_event_ids:
             return False
-        self.event_history.appendleft(item)
+        self.event_history_all.appendleft(item)
         if uid is not None:
             self.loaded_event_ids.add(uid)
         self._trim_history_locked(drop_from="oldest")
+        event_type = item.get("type")
+        if matches_filter(event_type, self.filter_pattern, self.muted_types):
+            self.event_history.appendleft(item)
         return True
 
     def _append_oldest_event_locked(self, item):
         uid = self._event_uid(item)
         if uid is not None and uid in self.loaded_event_ids:
             return False
-        self.event_history.append(item)
+        self.event_history_all.append(item)
         if uid is not None:
             self.loaded_event_ids.add(uid)
         self._trim_history_locked(drop_from="newest")
+        event_type = item.get("type")
+        if matches_filter(event_type, self.filter_pattern, self.muted_types):
+            self.event_history.append(item)
         return True
 
     def _build_event_item(self, event_type, timestamp, key, payload=None, producer=None,
@@ -1191,17 +1359,14 @@ class EventBusVisualizer:
         with self.lock:
             self.total_count += 1
             self._recent_timestamps.append(now)
+
+            if event_type not in self.event_type_counts:
+                self.event_type_counts[event_type] = 0
+            self.event_type_counts[event_type] += 1
+
             producer = self._classify_event_locked(event_type)
 
-            # Consumers are intentionally omitted from the current explorer-focused UI.
-            # Keep the mapping and counter logic nearby so it can be re-enabled later.
             consumers = []
-            # consumers = get_consumers(event_type)
-            # for csvc in consumers:
-            #     self._ensure_consumer(csvc)
-            #     self.consumer_counts[csvc] += 1
-            #     cfg = svc_style(csvc)
-            #     self.consumer_pipes[csvc].append(cfg["icon"])
 
             item = self._build_event_item(
                 event_type,
@@ -1224,14 +1389,15 @@ class EventBusVisualizer:
                 self.viewport_start = 0
             else:
                 self.pending_events.append(item)
+            self._mark_dirty()
 
     def _calc_eps(self):
         now = time.monotonic()
         with self.lock:
-            while self._recent_timestamps and (now - self._recent_timestamps[0]) > 5.0:
+            while self._recent_timestamps and (now - self._recent_timestamps[0]) > 10.0:
                 self._recent_timestamps.popleft()
             count = len(self._recent_timestamps)
-        return count / 5.0 if count else 0.0
+        return count / 10.0 if count else 0.0
 
     def _tick_pipelines(self):
         with self.lock:
@@ -1258,6 +1424,7 @@ class EventBusVisualizer:
             old_index = self.selected_index
             old_follow_mode = self.follow_mode
             self.selected_index = max(0, min(self.selected_index + delta, max_index))
+            self.payload_scroll = 0
             self.follow_mode = (self.selected_index == 0)
             page_size = self._page_size()
             if self.follow_mode:
@@ -1273,12 +1440,13 @@ class EventBusVisualizer:
 
             max_start = max(0, len(self.event_history) - page_size)
             self.viewport_start = max(0, min(self.viewport_start, max_start))
+            self._mark_dirty()
 
     def _page_size(self):
         return max(5, self.viewport_rows)
 
     def _queue_page_size(self):
-        return max(5, self.queue_viewport_rows)
+        return max(1, self.queue_viewport_rows)
 
     def _set_selection(self, index):
         with self.lock:
@@ -1303,6 +1471,17 @@ class EventBusVisualizer:
 
             max_start = max(0, len(self.event_history) - page_size)
             self.viewport_start = max(0, min(self.viewport_start, max_start))
+            self._mark_dirty()
+
+    def _rebuild_filtered_history_locked(self):
+        self.event_history.clear()
+        self.selected_index = 0
+        self.viewport_start = 0
+        for item in reversed(list(self.event_history_all)):
+            event_type = item.get("type")
+            if matches_filter(event_type, self.filter_pattern, self.muted_types):
+                self.event_history.appendleft(item)
+        self._mark_dirty()
 
     def _toggle_follow_mode(self):
         with self.lock:
@@ -1311,10 +1490,18 @@ class EventBusVisualizer:
                 self._flush_pending_events_locked()
                 self.selected_index = 0
                 self.viewport_start = 0
+            self._mark_dirty()
 
-    def _toggle_focus(self):
+    def _toggle_focus(self, backwards=False):
         with self.lock:
-            self.focus_pane = "queue" if self.focus_pane == "history" else "history"
+            panes = ["history", "payload", "queue", "muted"]
+            current_idx = panes.index(self.focus_pane) if self.focus_pane in panes else 0
+            if backwards:
+                self.focus_pane = panes[(current_idx - 1) % len(panes)]
+            else:
+                self.focus_pane = panes[(current_idx + 1) % len(panes)]
+            self.payload_scroll = 0
+            self._mark_dirty()
 
     def _move_queue_selection(self, delta):
         with self.lock:
@@ -1338,6 +1525,7 @@ class EventBusVisualizer:
 
             max_start = max(0, len(lag_items) - page_size)
             self.queue_viewport_start = max(0, min(self.queue_viewport_start, max_start))
+            self._mark_dirty()
 
     def _set_queue_selection(self, index):
         with self.lock:
@@ -1357,6 +1545,51 @@ class EventBusVisualizer:
 
             max_start = max(0, len(lag_items) - page_size)
             self.queue_viewport_start = max(0, min(self.queue_viewport_start, max_start))
+            self._mark_dirty()
+
+    def _move_muted_selection(self, delta):
+        with self.lock:
+            muted = sorted(self.muted_types)
+            if not muted:
+                self.muted_selected_index = 0
+                self.muted_viewport_start = 0
+                return
+
+            max_index = len(muted) - 1
+            old_index = self.muted_selected_index
+            self.muted_selected_index = max(0, min(self.muted_selected_index + delta, max_index))
+            page_size = self.muted_viewport_rows
+
+            if self.muted_selected_index > old_index:
+                if self.muted_selected_index >= self.muted_viewport_start + page_size:
+                    self.muted_viewport_start = self.muted_selected_index - page_size + 1
+            elif self.muted_selected_index < old_index:
+                if self.muted_selected_index < self.muted_viewport_start:
+                    self.muted_viewport_start = self.muted_selected_index
+
+            max_start = max(0, len(muted) - page_size)
+            self.muted_viewport_start = max(0, min(self.muted_viewport_start, max_start))
+            self._mark_dirty()
+
+    def _set_muted_selection(self, index):
+        with self.lock:
+            muted = sorted(self.muted_types)
+            if not muted:
+                self.muted_selected_index = 0
+                self.muted_viewport_start = 0
+                return
+
+            max_index = len(muted) - 1
+            self.muted_selected_index = max(0, min(index, max_index))
+            page_size = self.muted_viewport_rows
+            if self.muted_selected_index < self.muted_viewport_start:
+                self.muted_viewport_start = self.muted_selected_index
+            elif self.muted_selected_index >= self.muted_viewport_start + page_size:
+                self.muted_viewport_start = self.muted_selected_index - page_size + 1
+
+            max_start = max(0, len(muted) - page_size)
+            self.muted_viewport_start = max(0, min(self.muted_viewport_start, max_start))
+            self._mark_dirty()
 
     def _selected_item(self):
         with self.lock:
@@ -1389,8 +1622,43 @@ class EventBusVisualizer:
                     self.running = False
                     return
                 if chars == b"\t":
-                    self._toggle_focus()
+                    self._toggle_focus(backwards=False)
                     continue
+
+                with self.lock:
+                    filter_interactive = self.filter_interactive_mode
+
+                if filter_interactive:
+                    if chars in (b"\r", b"\n"):
+                        with self.lock:
+                            pattern = self.filter_input.strip() if self.filter_input.strip() else None
+                            self.filter_pattern = pattern
+                            self._rebuild_filtered_history_locked()
+                            self.filter_interactive_mode = False
+                            if pattern:
+                                self.status_message = f"Filter: {pattern}"
+                                self.status_level = "bold cyan"
+                            else:
+                                self.status_message = "Filter cleared"
+                                self.status_level = "dim"
+                            self._mark_dirty()
+                    elif chars in (b"\x1b", b"\x27"):
+                        with self.lock:
+                            self.filter_interactive_mode = False
+                            self.filter_input = ""
+                            self.status_message = None
+                            self.status_level = "dim"
+                            self._mark_dirty()
+                    elif chars in (b"\x7f", b"\b"):
+                        with self.lock:
+                            self.filter_input = self.filter_input[:-1]
+                            self._mark_dirty()
+                    elif 32 <= ord(chars) <= 126:
+                        with self.lock:
+                            self.filter_input += chars.decode("utf-8", errors="ignore")
+                            self._mark_dirty()
+                    continue
+
                 if chars == b"\x1b":
                     seq = chars
                     for _ in range(4):
@@ -1409,42 +1677,120 @@ class EventBusVisualizer:
                     if focus_pane == "history":
                         self._request_older_history()
                     continue
+                if chars == b":":
+                    with self.lock:
+                        self.filter_interactive_mode = True
+                        self.filter_input = ""
+                        self.status_message = "Enter filter pattern (e.g., ORDER_* or leave blank to clear)"
+                        self.status_level = "bold cyan"
+                        self._mark_dirty()
+                    continue
+                if chars == b"x":
+                    with self.lock:
+                        current_focus = self.focus_pane
+                    if current_focus == "muted":
+                        with self.lock:
+                            muted = sorted(self.muted_types)
+                            if muted and self.muted_selected_index < len(muted):
+                                event_type = muted[self.muted_selected_index]
+                                self.muted_types.discard(event_type)
+                                self._rebuild_filtered_history_locked()
+                                self.muted_selected_index = min(self.muted_selected_index, max(0, len(self.muted_types) - 1))
+                                self.status_message = f"Unmuted: {event_type}"
+                                self.status_level = "bold green"
+                    else:
+                        selected = self._selected_item()
+                        if selected:
+                            event_type = selected.get("type")
+                            if event_type:
+                                with self.lock:
+                                    self.muted_types.add(event_type)
+                                    self._rebuild_filtered_history_locked()
+                                    self.status_message = f"Muted: {event_type}"
+                                    self.status_level = "bold red"
+                    continue
+                if chars == b"X":
+                    with self.lock:
+                        if self.muted_types:
+                            self.muted_types.clear()
+                            self._rebuild_filtered_history_locked()
+                            self.status_message = "All mutes cleared"
+                            self.status_level = "dim"
+                    continue
 
                 with self.lock:
                     focus_pane = self.focus_pane
                     history_len = len(self.event_history)
                     queue_len = len(self.group_lags)
+                    muted_len = len(self.muted_types)
 
                 if chars in (b"j", b"\x1b[B"):
                     if focus_pane == "queue":
                         self._move_queue_selection(1)
+                    elif focus_pane == "muted":
+                        self._move_muted_selection(1)
+                    elif focus_pane == "payload":
+                        with self.lock:
+                            self.payload_scroll += 1
+                            self._mark_dirty()
                     else:
-                        self._move_selection(1)
+                        with self.lock:
+                            at_end = (history_len > 0 and self.selected_index == history_len - 1)
+                        if at_end and not self.follow_mode:
+                            self._request_older_history()
+                        else:
+                            self._move_selection(1)
                 elif chars in (b"k", b"\x1b[A"):
                     if focus_pane == "queue":
                         self._move_queue_selection(-1)
+                    elif focus_pane == "muted":
+                        self._move_muted_selection(-1)
+                    elif focus_pane == "payload":
+                        with self.lock:
+                            self.payload_scroll = max(0, self.payload_scroll - 1)
+                            self._mark_dirty()
                     else:
                         self._move_selection(-1)
                 elif chars == b"\x1b[5~":
                     if focus_pane == "queue":
                         self._move_queue_selection(-self._queue_page_size())
+                    elif focus_pane == "muted":
+                        self._move_muted_selection(-5)
                     else:
                         self._move_selection(-self._page_size())
                 elif chars == b"\x1b[6~":
                     if focus_pane == "queue":
                         self._move_queue_selection(self._queue_page_size())
+                    elif focus_pane == "muted":
+                        self._move_muted_selection(5)
                     else:
-                        self._move_selection(self._page_size())
+                        with self.lock:
+                            at_end = (history_len > 0 and self.selected_index == history_len - 1)
+                        if at_end and not self.follow_mode:
+                            self._request_older_history()
+                        else:
+                            self._move_selection(self._page_size())
                 elif chars in (b"g",):
                     if focus_pane == "queue":
                         self._set_queue_selection(0)
+                    elif focus_pane == "muted":
+                        self._set_muted_selection(0)
                     else:
                         self._set_selection(0)
                 elif chars in (b"G",):
                     if focus_pane == "queue":
                         self._set_queue_selection(queue_len - 1)
+                    elif focus_pane == "muted":
+                        self._set_muted_selection(muted_len - 1)
                     else:
-                        self._set_selection(history_len - 1)
+                        with self.lock:
+                            at_end = (history_len > 0 and self.selected_index == history_len - 1)
+                        if at_end and not self.follow_mode:
+                            self._request_older_history()
+                        else:
+                            self._set_selection(history_len - 1)
+                elif chars == b"\x1b[Z":
+                    self._toggle_focus(backwards=True)
         finally:
             try:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
@@ -1475,21 +1821,21 @@ class EventBusVisualizer:
 
                 segments = []
                 if direction == "out":
-                    segments.append(("\u25c0\u2500", f"dim {color}"))
+                    segments.append(("◀─", f"dim {color}"))
                     for slot in pipe[-PIPELINE_WIDTH:]:
                         if slot:
-                            segments.append(("\u2588", f"bold {color}"))
+                            segments.append(("█", f"bold {color}"))
                         else:
-                            segments.append(("\u2500", f"dim {color}"))
-                    segments.append(("\u2500\u25b6", f"dim {color}"))
+                            segments.append(("─", f"dim {color}"))
+                    segments.append(("─▶", f"dim {color}"))
                 else:
-                    segments.append(("\u25c0\u2500", f"dim {color}"))
+                    segments.append(("◀─", f"dim {color}"))
                     for slot in pipe[-PIPELINE_WIDTH:]:
                         if slot:
-                            segments.append(("\u2588", f"bold {color}"))
+                            segments.append(("█", f"bold {color}"))
                         else:
-                            segments.append(("\u2500", f"dim {color}"))
-                    segments.append(("\u2500\u25b6", f"dim {color}"))
+                            segments.append(("─", f"dim {color}"))
+                    segments.append(("─▶", f"dim {color}"))
 
                 pipe_text = Text()
                 for char, style in segments:
@@ -1501,24 +1847,32 @@ class EventBusVisualizer:
         return table
 
     def _render_history_panel(self, height, focused=False):
+        term_width = self.console.width or 80
+        show_key = term_width >= 60
+        show_date = term_width >= 80
+
         table = Table(show_header=True, header_style="bold dim", box=None, padding=(0, 1), expand=True)
-        table.add_column("Key", no_wrap=True, ratio=1)
-        table.add_column("Date", no_wrap=True, ratio=1)
+        if show_key:
+            table.add_column("Key", no_wrap=True, ratio=1)
+        if show_date:
+            table.add_column("Date", no_wrap=True, ratio=1)
         table.add_column("Time", no_wrap=True, ratio=1)
         table.add_column("Event", no_wrap=True, ratio=4)
 
         with self.lock:
             all_items = list(self.event_history)
-            max_rows = max(height - 4, 10)
+            max_rows = max(height - 5, 3)
             self.viewport_rows = max_rows
             selected_index = min(self.selected_index, max(len(all_items) - 1, 0))
             max_start = max(0, len(all_items) - max_rows)
-            self.viewport_start = max(0, min(self.viewport_start, max_start))
+
             if all_items:
                 if selected_index < self.viewport_start:
                     self.viewport_start = selected_index
                 elif selected_index >= self.viewport_start + max_rows:
-                    self.viewport_start = max(0, selected_index - max_rows + 1)
+                    self.viewport_start = selected_index - max_rows + 1
+
+            self.viewport_start = max(0, min(self.viewport_start, max_start))
             start = self.viewport_start
             items = all_items[start:start + max_rows]
             if focused and items:
@@ -1529,11 +1883,12 @@ class EventBusVisualizer:
         for idx, item in enumerate(items):
             if "error" in item:
                 row_style = "bold black on bright_white" if idx == visible_selected_index else ""
-                error_cells = [
-                    Text(""),
-                    Text("---- -- --", style="bold red" if idx == visible_selected_index else "red"),
-                    Text("--:--:--", style="bold red" if idx == visible_selected_index else "red"),
-                ]
+                error_cells = []
+                if show_key:
+                    error_cells.append(Text(""))
+                if show_date:
+                    error_cells.append(Text("---- -- --", style="bold red" if idx == visible_selected_index else "red"))
+                error_cells.append(Text("--:--:--", style="bold red" if idx == visible_selected_index else "red"))
                 error_cells.append(Text(f"ERROR: {item['error']}", style="bold red"))
                 table.add_row(*error_cells, style=row_style)
                 continue
@@ -1551,11 +1906,13 @@ class EventBusVisualizer:
             date_style = "bold black" if idx == visible_selected_index else "dim"
             time_style = "bold black" if idx == visible_selected_index else "dim"
             event_style = "bold black" if idx == visible_selected_index else pcolor
-            row_cells = [
-                Text(str(item.get("key") or ""), style=key_style),
-                Text(item.get("date", "----------"), style=date_style),
-                Text(item["time"], style=time_style),
-            ]
+
+            row_cells = []
+            if show_key:
+                row_cells.append(Text(str(item.get("key") or ""), style=key_style))
+            if show_date:
+                row_cells.append(Text(item.get("date", "----------"), style=date_style))
+            row_cells.append(Text(item["time"], style=time_style))
             row_cells.append(Text(item["type"], style=event_style))
             table.add_row(*row_cells, style=row_style)
 
@@ -1568,7 +1925,7 @@ class EventBusVisualizer:
 
         with self.lock:
             lag_items = sorted(self.group_lags.items(), key=lambda x: -x[1])
-            max_rows = max(self.queue_viewport_rows, 5)
+            max_rows = self._queue_page_size()
             self.queue_selected_index = max(0, min(self.queue_selected_index, max(len(lag_items) - 1, 0)))
             max_start = max(0, len(lag_items) - max_rows)
             self.queue_viewport_start = max(0, min(self.queue_viewport_start, max_start))
@@ -1610,7 +1967,7 @@ class EventBusVisualizer:
 
         return table
 
-    def _render_payload_panel(self):
+    def _render_payload_panel(self, available_height=None):
         selected = self._selected_item()
         if not selected:
             return Text("Waiting for events...", style="dim")
@@ -1618,14 +1975,59 @@ class EventBusVisualizer:
         if "error" in selected:
             return Text(selected["error"], style="bold red")
 
-        width = max((self.console.width // 3) - 6, 36)
-        lines = format_payload(selected.get("payload"), max_width=width)
-        payload_text = Text()
-        for i, line in enumerate(lines):
+        event_type = selected.get("type", "UNKNOWN")
+        type_text = Text(f"{event_type}\n", style="bold")
+
+        width = max((self.console.width // 3) - 6, 20) if self.console.width else 36
+        lines = format_payload(selected.get("payload"), max_width=width, max_lines=1000)
+
+        with self.lock:
+            scroll = self.payload_scroll
+
+        visible_height = max((available_height or 15) - 5, 1)
+        max_scroll = max(0, len(lines) - visible_height)
+        scroll = max(0, min(scroll, max_scroll))
+        visible_lines = lines[scroll:scroll + visible_height]
+
+        payload_text = type_text
+        for i, line in enumerate(visible_lines):
             if i:
                 payload_text.append("\n")
             payload_text.append(line, style="dim")
+
+        if scroll > 0:
+            payload_text.append("\n▲", style="dim")
+        if scroll < max_scroll:
+            payload_text.append("\n▼", style="dim")
+
         return payload_text
+
+    def _render_stats_panel(self):
+        with self.lock:
+            type_counts = dict(self.event_type_counts)
+            filter_pattern = self.filter_pattern
+            total = self.total_count
+
+        if not type_counts:
+            return Text("No events yet", style="dim")
+
+        sorted_types = sorted(type_counts.items(), key=lambda x: -x[1])[:12]
+        stats_text = Text()
+
+        if filter_pattern:
+            stats_text.append(f"Filter: {filter_pattern}\n", style="bold cyan")
+            stats_text.append("\n", style="dim")
+
+        for event_type, count in sorted_types:
+            pct = (count / total * 100) if total > 0 else 0
+            bar_width = max(1, int(pct / 5))
+            bar = "▓" * bar_width
+            name_width = 20 if (self.console.width or 80) >= 80 else 15
+            stats_text.append(f"{event_type[:name_width]:{name_width}s} ", style="dim")
+            stats_text.append(f"{bar:12s} ", style="green")
+            stats_text.append(f"{count:6,d} ({pct:5.1f}%)\n", style="bold")
+
+        return stats_text
 
     def _render(self):
         eps = self._calc_eps()
@@ -1652,6 +2054,10 @@ class EventBusVisualizer:
             pending_count = len(self.pending_events)
             history_loading = self.history_loading
             history_exhausted = self.history_exhausted
+            filter_pattern = self.filter_pattern
+            filter_interactive = self.filter_interactive_mode
+            filter_input = self.filter_input
+            muted_count = len(self.muted_types)
         paused = not follow_mode
         header_style = "bold white on dark_green" if not paused else "bold black on yellow"
         status_style = "bold green" if follow_mode else "bold black on yellow"
@@ -1681,63 +2087,198 @@ class EventBusVisualizer:
                 status_text.append(f"  lag: {lag:,}  ", style="bold red")
         if self.unmapped_count:
             status_text.append(f"  {self.unmapped_count} unmapped  ", style="bold red")
+        if filter_pattern:
+            status_text.append(f"  FILTER: {filter_pattern}  ", style="bold cyan")
+        if muted_count:
+            status_text.append(f"  {muted_count} muted  ", style="bold red")
+        if filter_interactive:
+            status_text.append(f"  > {filter_input}_  ", style="bold cyan on black")
         if status_message:
             status_text.append(f"  {status_message}  ", style=status_level)
+        focus_labels = {"history": "Events", "payload": "Payload", "queue": "Lag", "muted": "Muted"}
+        focus_label = focus_labels.get(focus_pane, "Unknown")
         status_text.append(
-            f"  Focus: {'Events' if focus_pane == 'history' else 'Lag'}  ",
+            f"  Focus: {focus_label}  ",
             style="bold cyan",
         )
 
-        controls_text = Text()
-        controls_text.append(
-            "Controls: Scroll j/k or arrows  Page PgUp/PgDn  Load older b  Switch pane Tab  Follow newest f  Jump g/G  Exit q or Ctrl+C",
-            style="dim",
-        )
-        header_content = Group(controls_text, status_text)
+        term_width = max(self.console.width or 80, 40)
+        term_height = max(self.console.height or 24, 10)
+        show_sidebar = term_width >= 60
+        sidebar_size = min(32, max(term_width // 3, 15)) if show_sidebar else 0
 
         layout = Layout()
-        layout.split_column(
-            Layout(name="header", size=2),
+        if show_sidebar:
+            layout.split_row(
+                Layout(name="sidebar", size=sidebar_size),
+                Layout(name="main", ratio=1),
+            )
+        else:
+            layout.split_column(Layout(name="main", ratio=1))
+
+        if show_sidebar:
+            layout["sidebar"].split_column(
+                Layout(name="controls", ratio=3),
+                Layout(name="muted", ratio=2),
+            )
+
+            controls_content = Text()
+            if sidebar_size < 25:
+                controls_content.append("CONTROLS\n", style="bold cyan")
+                controls_content.append("j/k  Move\n", style="dim")
+                controls_content.append("Tab  Next\n", style="dim")
+                controls_content.append("f  Follow\n", style="dim")
+                controls_content.append("b  History\n", style="dim")
+                controls_content.append(":  Filter\n", style="dim")
+                controls_content.append("x  Mute\n", style="dim")
+                controls_content.append("q  Exit\n", style="dim")
+            else:
+                controls_content.append("GUIDE\n", style="bold cyan")
+                controls_content.append("View events in left pane,\n", style="dim")
+                controls_content.append("payload in middle, lag on\n", style="dim")
+                controls_content.append("right. Use j/k to select\n", style="dim")
+                controls_content.append("events and Tab to switch\n", style="dim")
+                controls_content.append("between panes.\n", style="dim")
+                controls_content.append("\nBROWSING\n", style="bold cyan")
+                controls_content.append("j/k/↑↓  Move/Scroll\n", style="dim")
+                controls_content.append("PgUp/PgDn  Page jump\n", style="dim")
+                controls_content.append("g/G  Top/Bottom\n", style="dim")
+                controls_content.append("Tab  Next pane\n", style="dim")
+                controls_content.append("\nEVENTS\n", style="bold cyan")
+                controls_content.append("f  Follow mode\n", style="dim")
+                controls_content.append("b  Load older\n", style="dim")
+                controls_content.append(":  Filter pattern\n", style="dim")
+                controls_content.append("x  Mute/Unmute type\n", style="dim")
+                controls_content.append("X  Clear all mutes\n", style="dim")
+                controls_content.append("\nEXIT\n", style="bold cyan")
+                controls_content.append("q or Ctrl+C\n", style="dim")
+
+            controls_panel = Panel(
+                controls_content,
+                title="[bold]Controls[/bold]",
+                border_style="dim",
+            )
+            layout["controls"].update(controls_panel)
+
+            muted_available_height = max((layout["muted"].size or 10) - 4, 1)
+
+            with self.lock:
+                muted = sorted(self.muted_types)
+                muted_selected = self.muted_selected_index
+                muted_viewport = self.muted_viewport_start
+                muted_focused = (focus_pane == "muted")
+                self.muted_viewport_rows = muted_available_height
+
+            visible_muted = muted[muted_viewport:muted_viewport + muted_available_height] if muted else []
+
+            muted_content = Text()
+            if visible_muted:
+                for i, mt in enumerate(visible_muted):
+                    absolute_index = muted_viewport + i
+                    is_selected = (absolute_index == muted_selected)
+                    if is_selected and muted_focused:
+                        muted_content.append(f"▶ ✕ {mt}\n", style="bold black on red")
+                    elif is_selected:
+                        muted_content.append(f"▶ ✕ {mt}\n", style="bold red")
+                    else:
+                        muted_content.append(f"  ✕ {mt}\n", style="red")
+            elif muted:
+                muted_content.append("(scroll)", style="dim")
+            else:
+                muted_content.append("None", style="dim")
+
+            muted_panel = Panel(
+                muted_content,
+                title="[bold black on bright_white] Muted [/bold black on bright_white]" if muted_focused else "[bold]Muted[/bold]",
+                border_style="bright_white" if muted_focused else ("red" if muted else "dim"),
+            )
+            layout["muted"].update(muted_panel)
+        else:
+            with self.lock:
+                self.muted_viewport_rows = 5
+
+        header_size = 3 if term_width < 100 else 2
+
+        layout["main"].split_column(
+            Layout(name="header", size=header_size),
             Layout(name="bottom", ratio=2),
         )
-        layout["header"].update(header_content)
+        layout["header"].update(status_text)
 
-        layout["bottom"].split_row(
-            Layout(name="log", ratio=3),
-            Layout(name="detail", ratio=1),
-        )
+        show_detail_panes = term_width >= 80 and term_height >= 20
 
-        layout["detail"].split_column(
-            Layout(name="payload", ratio=3),
-            Layout(name="queue", ratio=2),
-        )
+        if show_detail_panes:
+            layout["bottom"].split_row(
+                Layout(name="log", ratio=3),
+                Layout(name="detail", ratio=1),
+            )
+
+            layout["detail"].split_column(
+                Layout(name="payload", ratio=2),
+                Layout(name="stats", ratio=2),
+                Layout(name="queue", ratio=2),
+            )
+        else:
+            layout["bottom"].split_row(
+                Layout(name="log", ratio=2),
+                Layout(name="payload", ratio=1),
+            )
+
+        if term_width < 80:
+            log_title = "[bold black on bright_white] Events [/bold black on bright_white]" if focus_pane == "history" else "[bold]Events[/bold]"
+            log_subtitle = None
+            payload_title = "[bold black on bright_white] Payload [/bold black on bright_white]" if focus_pane == "payload" else "[bold]Payload[/bold]"
+            payload_subtitle = None
+        else:
+            log_title = "[bold black on bright_white] Event Log [/bold black on bright_white]" if focus_pane == "history" else "[bold]Event Log[/bold]"
+            log_subtitle = "[dim]Event stream[/dim]"
+            payload_title = "[bold black on bright_white] Latest Event Payload [/bold black on bright_white]" if focus_pane == "payload" else "[bold]Latest Event Payload[/bold]"
+            payload_subtitle = "[dim]Newest event JSON (scroll with j/k)[/dim]"
 
         log_panel = Panel(
             self._render_history_panel(
                 layout["log"].size or (self.console.height if self.console.height else 40),
                 focused=(focus_pane == "history"),
             ),
-            title="[bold black on bright_white] Event Log [/bold black on bright_white]" if focus_pane == "history" else "[bold]Event Log[/bold]",
-            subtitle="[dim]Event stream[/dim]",
+            title=log_title,
+            subtitle=log_subtitle,
             border_style="bright_white" if focus_pane == "history" else "dim",
         )
         layout["log"].update(log_panel)
 
         payload_panel = Panel(
-            self._render_payload_panel(),
-            title="[bold]Latest Event Payload[/bold]",
-            subtitle="[dim]Newest event JSON[/dim]",
-            border_style="magenta",
+            self._render_payload_panel(
+                available_height=layout["payload"].size or (self.console.height // 3 if self.console.height else 15),
+            ),
+            title=payload_title,
+            subtitle=payload_subtitle,
+            border_style="bright_white" if focus_pane == "payload" else "magenta",
         )
         layout["payload"].update(payload_panel)
 
-        self.queue_viewport_rows = max((layout["queue"].size or 10) - 4, 5)
-        queue_panel = Panel(
-            self._render_queue_panel(focused=(focus_pane == "queue")),
-            title="[bold black on bright_white] Consumer Group Lag [/bold black on bright_white]" if focus_pane == "queue" else "[bold]Consumer Group Lag[/bold]",
-            border_style="bright_white" if focus_pane == "queue" else "yellow",
-        )
-        layout["queue"].update(queue_panel)
+        if show_detail_panes:
+            estimated_detail_height = max((term_height - header_size - 4) // 2, 6)
+            estimated_queue_height = max(estimated_detail_height // 3, 6)
+            with self.lock:
+                self.queue_viewport_rows = max(estimated_queue_height - 4, 1)
+
+            stats_panel = Panel(
+                self._render_stats_panel(),
+                title="[bold]Event Type Distribution[/bold]",
+                subtitle="[dim]Top 12 by count[/dim]",
+                border_style="bright_yellow",
+            )
+            layout["stats"].update(stats_panel)
+
+            queue_panel = Panel(
+                self._render_queue_panel(focused=(focus_pane == "queue")),
+                title="[bold black on bright_white] Consumer Group Lag [/bold black on bright_white]" if focus_pane == "queue" else "[bold]Consumer Group Lag[/bold]",
+                border_style="bright_white" if focus_pane == "queue" else "yellow",
+            )
+            layout["queue"].update(queue_panel)
+        else:
+            with self.lock:
+                self.queue_viewport_rows = 5
 
         return layout
 
@@ -1745,7 +2286,9 @@ class EventBusVisualizer:
         self.console = Console()
         input_thread = None
 
-        if self.demo:
+        if self.stdin_mode:
+            thread = threading.Thread(target=self._consume_stdin, daemon=True)
+        elif self.demo:
             thread = threading.Thread(target=self._demo_producer, daemon=True)
         else:
             thread = threading.Thread(target=self._consume_kafka, daemon=True)
@@ -1760,15 +2303,33 @@ class EventBusVisualizer:
             input_thread = threading.Thread(target=self._input_loop, daemon=True)
             input_thread.start()
 
+        if self.console.width and self.console.width < 40:
+            self.console.print("[bold red]Terminal too narrow (minimum 40 columns required)[/bold red]")
+            return
+        if self.console.height and self.console.height < 10:
+            self.console.print("[bold red]Terminal too short (minimum 10 rows required)[/bold red]")
+            return
+
         tick_count = 0
+        min_render_interval = 0.25
         try:
-            with Live(self._render(), console=self.console, refresh_per_second=20, screen=True) as live:
+            with Live(self._render(), console=self.console, refresh_per_second=4, screen=True) as live:
                 while self.running:
-                    time.sleep(0.02)
+                    time.sleep(0.05)
                     tick_count += 1
-                    if tick_count % 9 == 0:
+                    if tick_count % 4 == 0:
                         self._tick_pipelines()
-                    live.update(self._render())
+                    now = time.monotonic()
+                    elapsed = now - self._last_render_time
+                    if elapsed < min_render_interval:
+                        continue
+                    periodic = elapsed >= 2.0
+                    with self.lock:
+                        needs_render = self._dirty or periodic
+                        self._dirty = False
+                    if needs_render:
+                        self._last_render_time = now
+                        live.update(self._render())
         except KeyboardInterrupt:
             pass
         finally:
@@ -1805,6 +2366,8 @@ KEYBOARD CONTROLS:
     f                - Follow mode (tail newest)
     b                - Load older history batch
     :                - Filter by event type pattern
+    x                - Mute selected event type
+    X                - Clear all muted types
 
   Other:
     q, Ctrl+C        - Exit
@@ -1846,6 +2409,12 @@ EXAMPLES:
                         help="JSON field to use as the event timestamp; overrides auto-detection")
     parser.add_argument("--filter",
                         help="Filter events by type pattern. Supports wildcards (e.g., order_* matches order_created, order_shipped, etc.)")
+    parser.add_argument("--stdin", action="store_true",
+                        help="Read events as JSON lines from stdin instead of connecting to Kafka directly. "
+                             "Used by the k8s launcher to pipe events from a remote bridge.")
+    parser.add_argument("--http-bridge",
+                        help="HTTP bridge URL for on-demand history loading in stdin mode. "
+                             "Example: http://localhost:18080")
     args = parser.parse_args()
     demo_requested = args.demo or any(
         arg == "--demo-rate" or arg.startswith("--demo-rate=")
@@ -1885,6 +2454,9 @@ EXAMPLES:
         demo_rate=args.demo_rate,
         history_window_size=args.window_size,
         history_batch_size=args.history_batch_size,
+        filter_pattern=args.filter,
+        stdin_mode=args.stdin,
+        http_bridge_url=args.http_bridge,
     )
     viz.run()
 

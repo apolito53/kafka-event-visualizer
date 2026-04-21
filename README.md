@@ -7,13 +7,37 @@ The project is intentionally lightweight: one shell script, an embedded Python a
 ## Features
 
 - Scrollable event list with key, date, time, and event type
-- Payload inspector for the selected event
+- Payload inspector for the selected event (scrollable)
 - Consumer group lag pane with severity coloring
+- Event type distribution panel with bar charts
+- Event filtering by type pattern (case-insensitive, wildcards)
+- Event muting — hide noisy event types, toggle via interactive UI
 - Topic picker when no topic is provided
 - Replay from a timestamp or recent lookback window
-- Bounded history browser with explicit `load older` behavior
+- Bounded history browser with on-demand older event loading
+- Auto-load on scroll — reaching the bottom automatically fetches more history
+- Responsive layout that adapts to small and large terminal windows
+- Kubernetes mode — bridge pod streams events to local visualizer via pipe
 - Demo mode for UI testing without Kafka
 - Generic JSON event exploration with automatic event-type and time-field detection
+
+## Quick Start
+
+### Local Development
+
+Run against local Kafka (default: `localhost:9092`):
+
+```bash
+./run_local.sh
+```
+
+### Kubernetes
+
+Run against Kafka in your k8s cluster:
+
+```bash
+./run_on_k8s.sh --topic my-events --bootstrap kafka:9092
+```
 
 ## How It Works
 
@@ -31,7 +55,7 @@ The UI is built with `rich`, and Kafka access uses `kafka-python`.
 
 - Python 3
 - Access to a Kafka broker
-- A terminal with enough width/height to comfortably render the TUI
+- A terminal with at least 40 columns and 10 rows
 
 The script will auto-install these Python packages into a local `.venv` if needed:
 - `rich`
@@ -53,71 +77,157 @@ The script creates and reuses a project-local `.venv`, so it does not need to in
 If Kafka is running outside WSL, make sure the broker is reachable from the WSL environment and pass an explicit bootstrap address when needed:
 
 ```bash
-./kafka-event-visualizer.sh --bootstrap <host>:9092
+./run_local.sh --bootstrap <host>:9092
 ```
 
 ## Usage
 
-Basic startup with topic picker:
+### Basic
 
 ```bash
-./kafka-event-visualizer.sh
+# Topic picker + recent 200 events + tail
+./run_local.sh
+
+# Custom topic
+./run_local.sh --topic my-custom-topic
+
+# Different broker
+./run_local.sh --bootstrap kafka.prod:9092
 ```
 
-Connect to a specific broker and topic:
+### Filtering
 
 ```bash
-./kafka-event-visualizer.sh --bootstrap localhost:9092 --topic orders
+# Filter for order events
+./run_local.sh --filter ORDER
+
+# Wildcard pattern
+./run_local.sh --filter "INVOICE_*"
+
+# Interactive filter: press `:` in the UI
 ```
 
-Replay from a specific local timestamp:
+### Time-based Replay
 
 ```bash
-./kafka-event-visualizer.sh --topic orders --since "2026-04-17 09:30:00"
+# Start from 1 hour ago
+./run_local.sh --since-minutes 60
+
+# Start from specific timestamp
+./run_local.sh --since "2026-04-20 14:30:00"
+
+# Load more recent history on startup (default: 200 events)
+./run_local.sh --history-batch-size 500
 ```
 
-Replay from N minutes ago:
+### Memory Configuration
 
 ```bash
-./kafka-event-visualizer.sh --topic orders --since-minutes 30
+# Larger in-memory window for long sessions
+./run_local.sh --window-size 5000
+
+# Bigger history batches when pressing 'b'
+./run_local.sh --history-batch-size 500
 ```
 
-Run demo mode:
+### Kubernetes Examples
 
 ```bash
-./kafka-event-visualizer.sh --demo
-./kafka-event-visualizer.sh --demo-rate 25
+# Basic k8s usage
+./run_on_k8s.sh --topic my-events --bootstrap kafka:9092
+
+# With filter
+./run_on_k8s.sh --topic my-events --bootstrap kafka:9092 --filter ORDER
+
+# Load 30 minutes of history
+./run_on_k8s.sh --topic my-events --bootstrap kafka:9092 --since-minutes 30
 ```
 
-Tune the loaded history window:
+### Demo Mode
+
+Test the UI without Kafka:
 
 ```bash
-./kafka-event-visualizer.sh --topic orders --window-size 5000 --history-batch-size 500
+./run_local.sh --demo
+./run_local.sh --demo --demo-rate 25  # 25 events/sec
 ```
 
 ## Controls
 
-The event pane and lag pane share the same navigation model. Use `Tab` to switch focus.
+### Navigation
 
-- `j` / `k` or Up / Down: move selection
-- `PgUp` / `PgDn`: page up / down
-- `g` / `G`: jump to top / bottom
-- `Tab`: switch focus between Events and Consumer Group Lag
-- `f`: return to follow mode / resume tailing newest events
-- `b`: load an older history slice while browsing the event pane
-- `q` or `Ctrl+C`: exit
+| Key | Action |
+|-----|--------|
+| `j` / `k` or `↑` / `↓` | Move selection / scroll pane |
+| `PgUp` / `PgDn` | Page up / down |
+| `g` / `G` | Jump to top / bottom |
+| `Tab` / `Shift+Tab` | Cycle focus forward / backward |
 
-## History Browser Model
+### Event Control
 
-The visible event list is a bounded in-memory window.
+| Key | Action |
+|-----|--------|
+| `f` | Follow mode (tail newest events) |
+| `b` | Load older history batch |
+| `:` | Filter by event type pattern |
+| `x` | Mute selected event type (or unmute from muted pane) |
+| `X` | Clear all muted types |
+| `q` or `Ctrl+C` | Exit |
 
-- In `FOLLOW`, the list tails the newest events.
-- When you leave the newest event, the UI enters a frozen browsing state.
-- While browsing, live events continue to arrive but are buffered instead of mutating the visible list.
-- Press `b` to fetch an older bounded slice of topic history.
-- Returning to follow mode flushes buffered live events back into the visible window.
+### Panes
 
-Older-history fetches use a separate temporary consumer so the live tail consumer is not disturbed.
+Focus cycles through: **Events** → **Payload** → **Lag** → **Muted** → Events
+
+- **Events (left)**: Scrollable event log with type, key, timestamp
+- **Payload (middle top)**: JSON payload of selected event (scrollable)
+- **Stats (middle bottom)**: Event type distribution with bar chart
+- **Lag (right)**: Consumer group lag per topic
+- **Muted (sidebar)**: List of muted event types (navigate and unmute with `x`)
+
+## Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `run_local.sh` | Convenience wrapper for local Kafka (calls `kafka-event-visualizer.sh`) |
+| `run_on_k8s.sh` | Convenience wrapper for Kubernetes (calls `kafka-event-visualizer-k8s.sh`) |
+| `kafka-event-visualizer.sh` | Core visualizer script (can be used directly) |
+| `kafka-event-visualizer-k8s.sh` | Kubernetes bridge launcher (can be used directly) |
+
+## Architecture
+
+### Local Mode (`run_local.sh` / `kafka-event-visualizer.sh`)
+
+Runs directly on your machine, connects to Kafka via `kafka-python`:
+
+```
+[Your Terminal]
+      ↓
+[kafka-event-visualizer.sh]
+      ↓ kafka-python
+[Kafka Broker]
+```
+
+### Kubernetes Mode (`run_on_k8s.sh` / `kafka-event-visualizer-k8s.sh`)
+
+Runs a bridge in a temp pod, streams events to local visualizer via pipe:
+
+```
+[Your Terminal]
+      ↓
+[kafka-event-visualizer.sh --stdin]
+      ↑ JSON lines via pipe
+[kubectl exec]
+      ↑
+[Temp Pod: bridge script]
+  - Kafka consumer → stdout
+  - HTTP server (port 8080) → on-demand history
+      ↓ kafka-python
+[Kafka Broker Pods (in cluster)]
+```
+
+**Why a bridge pod?** Kafka advertised listeners inside k8s are often not reachable from your local machine. The bridge runs inside the cluster where it can access Kafka directly, and streams decoded JSON to the local visualizer over kubectl exec. Rich renders locally so the TUI stays responsive — no lag from rendering over a remote connection.
+
+The temporary pod is automatically cleaned up on exit.
 
 ## Flags
 
@@ -143,6 +253,12 @@ Older-history fetches use a separate temporary consumer so the live tail consume
   Number of older events to fetch each time `b` is pressed.
 - `--show-ephemeral-groups`
   Include UUID-like consumer groups in the lag pane.
+- `--filter PATTERN`
+  Filter events by type pattern. Supports wildcards (e.g., `ORDER_*`).
+- `--stdin`
+  Read events as JSON lines from stdin instead of connecting to Kafka directly. Used by the k8s launcher.
+- `--http-bridge URL`
+  HTTP bridge URL for on-demand history loading in stdin mode.
 
 ## Notes
 
@@ -150,13 +266,4 @@ Older-history fetches use a separate temporary consumer so the live tail consume
 - Kafka does not inherently know which service emitted a specific record unless producers include that metadata in headers or payloads.
 - Memory footprint scales mostly with `window-size` and average decoded payload size.
 - The script stores decoded payloads for the loaded history window so the payload pane remains browsable.
-
-## Future Directions
-
-Potential improvements that fit the current model:
-
-- better batching/coalescing for held key input
-- richer payload formatting and truncation controls
-- optional header inspection
-- export selected history slices
-- optional producer metadata display when headers or payload fields are available
+- The lag panel filters out consumer groups containing "visualizer", console consumers, and UUID-shaped ephemeral groups by default.
