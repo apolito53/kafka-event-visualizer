@@ -64,7 +64,7 @@ pick_topic() {
 
     echo "Fetching topic metadata from $KAFKA_BOOTSTRAP..." >&2
     if ! mapfile -t topics < <(
-        kubectl exec "$POD_NAME" -- python3 - "$KAFKA_BOOTSTRAP" <<'PY'
+        kubectl exec -i "$POD_NAME" -- python3 - "$KAFKA_BOOTSTRAP" <<'PY'
 import sys
 from kafka import KafkaConsumer
 
@@ -130,7 +130,7 @@ echo "Waiting for pod to be ready..." >&2
 kubectl wait --for=condition=Ready "pod/$POD_NAME" --timeout=120s >/dev/null
 
 echo "Installing kafka-python..." >&2
-kubectl exec "$POD_NAME" -- pip install --quiet kafka-python >/dev/null
+kubectl exec "$POD_NAME" -- pip install --quiet --disable-pip-version-check --root-user-action=ignore kafka-python >/dev/null
 
 if [ -z "$TOPIC" ]; then
     pick_topic
