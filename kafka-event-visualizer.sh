@@ -661,6 +661,8 @@ class EventBusVisualizer:
         self._tty = None
         self.filter_pattern = filter_pattern
         self.event_type_counts = {}
+        self.event_type_colors = {}
+        self.event_type_color_index = 0
         self.stats_time_windows = [
             ("All", None),
             ("5m", 5 * 60),
@@ -698,6 +700,15 @@ class EventBusVisualizer:
             self.consumer_pipes = {s: deque([None] * PIPELINE_WIDTH, maxlen=PIPELINE_WIDTH) for s in CONSUMER_ORDER}
 
         self.lock = threading.Lock()
+
+    def _event_type_color_locked(self, event_type):
+        if not event_type:
+            return "dim"
+        if event_type not in self.event_type_colors:
+            color = DYNAMIC_COLORS[self.event_type_color_index % len(DYNAMIC_COLORS)]
+            self.event_type_color_index += 1
+            self.event_type_colors[event_type] = color
+        return self.event_type_colors[event_type]
 
     def _mark_dirty(self):
         self._dirty = True
@@ -1290,6 +1301,7 @@ class EventBusVisualizer:
             self.loaded_event_ids.add(uid)
         self._trim_history_locked(drop_from="oldest")
         event_type = item.get("type")
+        item["event_color"] = self._event_type_color_locked(event_type)
         if matches_filter(event_type, self.filter_pattern, self.muted_types):
             self.event_history.appendleft(item)
         return True
@@ -1303,6 +1315,7 @@ class EventBusVisualizer:
             self.loaded_event_ids.add(uid)
         self._trim_history_locked(drop_from="newest")
         event_type = item.get("type")
+        item["event_color"] = self._event_type_color_locked(event_type)
         if matches_filter(event_type, self.filter_pattern, self.muted_types):
             self.event_history.append(item)
         return True
@@ -1327,9 +1340,11 @@ class EventBusVisualizer:
             display_ts = datetime.now().strftime("%H:%M:%S")
 
         uid = (topic, partition, offset) if topic is not None and partition is not None and offset is not None else None
+        event_color = self._event_type_color_locked(event_type)
         return {
             "uid": uid,
             "type": event_type,
+            "event_color": event_color,
             "producer": producer,
             "consumers": consumers,
             "date": display_date,
@@ -1931,19 +1946,13 @@ class EventBusVisualizer:
                 table.add_row(*error_cells, style=row_style)
                 continue
 
-            producer = item.get("producer")
-
-            if producer:
-                pcfg = svc_style(producer)
-                pcolor = pcfg["color"]
-            else:
-                pcolor = "dim"
+            event_color = item.get("event_color", "dim")
 
             row_style = "bold black on bright_white" if idx == visible_selected_index else ""
             key_style = "bold black" if idx == visible_selected_index else "dim"
             date_style = "bold black" if idx == visible_selected_index else "dim"
             time_style = "bold black" if idx == visible_selected_index else "dim"
-            event_style = "bold black" if idx == visible_selected_index else pcolor
+            event_style = "bold black" if idx == visible_selected_index else event_color
 
             row_cells = []
             if show_key:
@@ -2030,7 +2039,8 @@ class EventBusVisualizer:
             return Text(selected["error"], style="bold red")
 
         event_type = selected.get("type", "UNKNOWN")
-        type_text = Text(f"{event_type}\n", style="bold")
+        event_color = selected.get("event_color", "bold")
+        type_text = Text(f"{event_type}\n", style=f"bold {event_color}")
 
         width = max((self.console.width // 3) - 6, 20) if self.console.width else 36
         lines = format_payload(selected.get("payload"), max_width=width, max_lines=1000)
@@ -2084,6 +2094,7 @@ class EventBusVisualizer:
                 if t:
                     type_counts[t] = type_counts.get(t, 0) + 1
             filter_pattern = self.filter_pattern
+            type_colors = dict(self.event_type_colors)
 
         if not type_counts:
             return Text("No events in this window", style="dim")
@@ -2102,9 +2113,10 @@ class EventBusVisualizer:
             bar_width = max(1, int(pct / 5))
             bar = "▓" * bar_width
             name_width = 20 if (self.console.width or 80) >= 80 else 15
-            stats_text.append(f"{event_type[:name_width]:{name_width}s} ", style="dim")
-            stats_text.append(f"{bar:12s} ", style="green")
-            stats_text.append(f"{count:6,d} ({pct:5.1f}%)\n", style="bold")
+            color = type_colors.get(event_type, "dim")
+            stats_text.append(f"{event_type[:name_width]:{name_width}s} ", style=color)
+            stats_text.append(f"{bar:12s} ", style=color)
+            stats_text.append(f"{count:6,d} ({pct:5.1f}%)\n", style=f"bold {color}")
 
         return stats_text
 
