@@ -39,6 +39,8 @@ Run against Kafka in your k8s cluster:
 ./run_on_k8s.sh
 ```
 
+When no topic is passed, the k8s launcher opens a terminal menu for topic selection.
+
 ## How It Works
 
 The entrypoint is [`kafka-event-visualizer.sh`](./kafka-event-visualizer.sh).

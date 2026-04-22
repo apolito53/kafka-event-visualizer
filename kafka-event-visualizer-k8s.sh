@@ -86,6 +86,39 @@ PY
         return 1
     fi
 
+    if [ -t 0 ] && [ -t 1 ] && command -v whiptail >/dev/null 2>&1; then
+        local menu_items=()
+        local menu_height
+        local dialog_height
+        local dialog_width=96
+        local i
+
+        menu_height="${#topics[@]}"
+        if [ "$menu_height" -gt 18 ]; then
+            menu_height=18
+        fi
+        dialog_height=$((menu_height + 9))
+
+        for i in "${!topics[@]}"; do
+            menu_items+=("$((i + 1))" "${topics[$i]}")
+        done
+
+        if selected=$(whiptail \
+            --title "Kafka Topic Picker" \
+            --ok-button "Launch" \
+            --cancel-button "Cancel" \
+            --menu "Choose a topic from $KAFKA_BOOTSTRAP:" \
+            "$dialog_height" "$dialog_width" "$menu_height" \
+            "${menu_items[@]}" \
+            3>&1 1>&2 2>&3); then
+            TOPIC="${topics[$((selected - 1))]}"
+            return 0
+        fi
+
+        echo "Topic selection canceled." >&2
+        return 1
+    fi
+
     echo "" >&2
     echo "Select a Kafka topic:" >&2
     local i
