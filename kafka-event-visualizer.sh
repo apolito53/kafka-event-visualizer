@@ -2535,16 +2535,16 @@ EXAMPLES:
         since_time = datetime.now().astimezone() - timedelta(minutes=args.since_minutes)
 
     topic = args.topic
-    if not topic and not demo_requested:
+    if not topic and not demo_requested and not args.stdin:
         topic = pick_topic(args.bootstrap)
         if not topic:
             return
-    if not demo_requested and since_time is None:
+    if not demo_requested and not args.stdin and since_time is None:
         since_time, canceled = pick_start_time()
         if canceled:
             return
     if not topic:
-        topic = "demo-events"
+        topic = "stdin-events" if args.stdin else "demo-events"
 
     viz = EventBusVisualizer(
         bootstrap_servers=args.bootstrap,

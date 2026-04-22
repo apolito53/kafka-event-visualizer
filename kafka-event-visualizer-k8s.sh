@@ -480,4 +480,4 @@ lag_thread.start()
 
 # Run main Kafka consumer (blocks)
 load_initial_history($BRIDGE_ARGS)
-" | bash "$VISUALIZER_SCRIPT" --stdin --http-bridge "http://localhost:$HTTP_PORT" --window-size "$WINDOW_SIZE" ${FILTER:+--filter "$FILTER"}
+" | bash "$VISUALIZER_SCRIPT" --stdin --bootstrap "$KAFKA_BOOTSTRAP" --topic "$TOPIC" --http-bridge "http://localhost:$HTTP_PORT" --window-size "$WINDOW_SIZE" ${FILTER:+--filter "$FILTER"}
