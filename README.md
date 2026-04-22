@@ -10,6 +10,7 @@ The project is intentionally lightweight: one shell script, an embedded Python a
 - Payload inspector for the selected event (scrollable)
 - Consumer group lag pane with live and time-windowed peak lag views
 - Event type distribution panel with selectable time windows and bar charts
+- Stable color coding for each discovered event type across panes
 - Event filtering by type pattern (case-insensitive, wildcards)
 - Event muting — hide noisy event types, toggle via interactive UI
 - Topic picker when no topic is provided
@@ -185,8 +186,8 @@ Test the UI without Kafka:
 Focus cycles through: **Events** → **Payload** → **Distribution** → **Lag** → **Muted** → Events
 
 - **Events (left)**: Scrollable event log with type, key, timestamp
-- **Payload (middle top)**: JSON payload of selected event (scrollable)
-- **Distribution (middle bottom)**: Event type distribution with bar chart and time window selector (`←`/`→`)
+- **Payload (middle top)**: JSON payload of selected event (scrollable), headed by the selected event's color-coded type
+- **Distribution (middle bottom)**: Event type distribution with color-coded bar chart and time window selector (`←`/`→`)
 - **Lag (right)**: Consumer group lag per topic, with peak lag over selected time windows
 - **Muted (sidebar)**: List of muted event types (navigate and unmute with `x`)
 
@@ -242,6 +243,10 @@ The Distribution and Lag panes support these windows: `All`, `5m`, `30m`, `1h`, 
 Tab to the Distribution pane and use `←` / `→` to recalculate event type counts from all events currently loaded in memory, including historical events loaded on startup or through older-history browsing.
 
 Tab to the Lag pane and use `←` / `→` to switch from live lag to peak lag over the selected window. Lag snapshots are recorded about every 5 seconds while the visualizer is running, including lag data streamed through the Kubernetes bridge.
+
+## Event Colors
+
+As event types are discovered, the visualizer assigns each distinct type a stable color for the current session. The event log, selected payload header, and Distribution pane all use the same color for the same event type, making recurring types easier to track while traffic streams in.
 
 ## Flags
 
